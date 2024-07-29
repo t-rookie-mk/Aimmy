@@ -10,7 +10,9 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Threading;
 using Visuality;
 
 namespace Aimmy2.AILogic
@@ -30,8 +32,10 @@ namespace Aimmy2.AILogic
 
         private Bitmap? _screenCaptureBitmap;
 
-        private readonly int ScreenWidth = WinAPICaller.ScreenWidth;
-        private readonly int ScreenHeight = WinAPICaller.ScreenHeight;
+        private int ScreenWidth = WinAPICaller.ScreenWidth;
+        private int ScreenHeight = WinAPICaller.ScreenHeight;
+
+        private DispatcherTimer _timer;
 
         private readonly RunOptions? _modeloptions;
         private InferenceSession? _onnxModel;
@@ -72,6 +76,16 @@ namespace Aimmy2.AILogic
 
             _modeloptions = new RunOptions();
 
+            // 设置初始分辨率
+            ScreenWidth = (int)SystemParameters.PrimaryScreenWidth;
+            ScreenHeight = (int)SystemParameters.PrimaryScreenHeight;
+
+            // 创建定时器，每5秒钟检查一次屏幕分辨率
+            _timer = new DispatcherTimer();
+            _timer.Interval = TimeSpan.FromSeconds(5);
+            _timer.Tick += Timer_Tick;
+            _timer.Start();
+
             var sessionOptions = new SessionOptions
             {
                 EnableCpuMemArena = true,
@@ -79,6 +93,7 @@ namespace Aimmy2.AILogic
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 ExecutionMode = ExecutionMode.ORT_PARALLEL
             };
+            
 
             // Attempt to load via DirectML (else fallback to CPU)
             Task.Run(() => InitializeModel(sessionOptions, modelPath));
@@ -88,50 +103,78 @@ namespace Aimmy2.AILogic
 
         private async Task InitializeModel(SessionOptions sessionOptions, string modelPath)
         {
-            try
-            {
-                await LoadModelAsync(sessionOptions, modelPath, useDirectML: true);
-            }
-            catch (Exception ex)
-            {
-                await Application.Current.Dispatcher.BeginInvoke(new Action(() => new NoticeBar($"Error starting the model via DirectML: {ex.Message}\n\nFalling back to CPU, performance may be poor.", 5000).Show()));
-                try
-                {
-                    await LoadModelAsync(sessionOptions, modelPath, useDirectML: false);
-                }
-                catch (Exception e)
-                {
-                    await Application.Current.Dispatcher.BeginInvoke(new Action(() => new NoticeBar($"Error starting the model via CPU: {e.Message}, you won't be able to aim assist at all.", 5000).Show()));
-                }
-            }
+            await LoadModelAsync(sessionOptions, modelPath);
 
             FileManager.CurrentlyLoadingModel = false;
         }
 
-        private async Task LoadModelAsync(SessionOptions sessionOptions, string modelPath, bool useDirectML)
+
+        private bool LoadViaDirectML(SessionOptions sessionOptions, string modelPath)
         {
             try
             {
-                if (useDirectML) { sessionOptions.AppendExecutionProvider_DML(); }
-                else { sessionOptions.AppendExecutionProvider_CPU(); }
+                sessionOptions.AppendExecutionProvider_DML();
 
                 _onnxModel = new InferenceSession(modelPath, sessionOptions);
                 _outputNames = new List<string>(_onnxModel.OutputMetadata.Keys);
 
-                // Validate the onnx model output shape (ensure model is OnnxV8)
-                ValidateOnnxShape();
+
+                return true;
             }
-            catch (Exception ex)
-            {
-                await Application.Current.Dispatcher.BeginInvoke(new Action(() => new NoticeBar($"Error starting the model: {ex.Message}", 5000).Show()));
+            catch (Exception e) {
+                new NoticeBar($"Error starting DirectML the model: {e.Message}", 5000).Show();
                 _onnxModel?.Dispose();
+                return false;
             }
+        }
+
+        private bool LoadViaCPU(SessionOptions sessionOptions, string modelPath)
+        {
+            try
+            {
+                sessionOptions.AppendExecutionProvider_CPU();
+
+                _onnxModel = new InferenceSession(modelPath, sessionOptions);
+                _outputNames = new List<string>(_onnxModel.OutputMetadata.Keys);
+
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                new NoticeBar($"Error starting cpu the model: {e.Message}", 5000).Show();
+                _onnxModel?.Dispose();
+                return false;
+            }
+        }
+
+        private async Task LoadModelAsync(SessionOptions sessionOptions, string modelPath)
+        {
+            if (!LoadViaDirectML(sessionOptions, modelPath))
+            {
+                if (!LoadViaCPU(sessionOptions, modelPath))
+                {
+                    await Application.Current.Dispatcher.BeginInvoke(new Action(() => new NoticeBar($"Error starting the model", 5000).Show()));
+                    _onnxModel?.Dispose();
+                    return;
+                }
+            }
+
+            // Validate the onnx model output shape (ensure model is OnnxV8)
+            ValidateOnnxShape();
 
             // Begin the loop
             _isAiLoopRunning = true;
             _aiLoopThread = new Thread(AiLoop);
             _aiLoopThread.IsBackground = true;
             _aiLoopThread.Start();
+        }
+
+        // 定时器触发时检查屏幕分辨率
+        private void Timer_Tick(object sender, EventArgs e)
+        {
+            ScreenWidth = (int)SystemParameters.PrimaryScreenWidth;
+            ScreenHeight = (int)SystemParameters.PrimaryScreenHeight;
         }
 
         private void ValidateOnnxShape()
@@ -512,6 +555,19 @@ namespace Aimmy2.AILogic
 
         #region Screen Capture
 
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool BitBlt(IntPtr hdcDest, int nXDest, int nYDest, int nWidth, int nHeight,
+                                      IntPtr hdcSrc, int nXSrc, int nYSrc, int dwRop);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetWindowDC(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        private const int SRCCOPY = 0x00CC0020;  // 常量用于BitBlt操作
+
         private void SaveFrame(Bitmap frame, Prediction? DoLabel = null)
         {
             if (!Dictionary.toggleState["Collect Data While Playing"] && Dictionary.toggleState["Constant AI Tracking"]) return;
@@ -538,16 +594,26 @@ namespace Aimmy2.AILogic
 
         public Bitmap? ScreenGrab(Rectangle detectionBox)
         {
+            // 检查位图尺寸是否需要更新
             if (_screenCaptureBitmap == null || _screenCaptureBitmap.Width != detectionBox.Width || _screenCaptureBitmap.Height != detectionBox.Height)
             {
-                _screenCaptureBitmap?.Dispose();
-                _graphics?.Dispose();
-
-                _screenCaptureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height, PixelFormat.Format24bppRgb);
-                _graphics = Graphics.FromImage(_screenCaptureBitmap);
+                _screenCaptureBitmap?.Dispose();  // 释放旧位图
+                _screenCaptureBitmap = new Bitmap(detectionBox.Width, detectionBox.Height, PixelFormat.Format32bppArgb);
             }
 
-            _graphics.CopyFromScreen(detectionBox.Left, detectionBox.Top, 0, 0, detectionBox.Size, CopyPixelOperation.SourceCopy);
+            // 使用GDI方法进行高效屏幕抓取
+            using (Graphics gDest = Graphics.FromImage(_screenCaptureBitmap))
+            {
+                IntPtr hdcDest = gDest.GetHdc();
+                IntPtr hdcSrc = GetWindowDC(IntPtr.Zero);  // 获取整个屏幕的DC
+
+                // 使用BitBlt进行屏幕抓取
+                BitBlt(hdcDest, 0, 0, detectionBox.Width, detectionBox.Height, hdcSrc, detectionBox.Left, detectionBox.Top, SRCCOPY);
+
+                // 释放资源
+                gDest.ReleaseHdc(hdcDest);
+                ReleaseDC(IntPtr.Zero, hdcSrc);
+            }
 
             return _screenCaptureBitmap;
         }
@@ -627,6 +693,7 @@ namespace Aimmy2.AILogic
             _graphics?.Dispose();
             _onnxModel?.Dispose();
             _modeloptions?.Dispose();
+            _timer?.Stop();
         }
 
         public class Prediction
